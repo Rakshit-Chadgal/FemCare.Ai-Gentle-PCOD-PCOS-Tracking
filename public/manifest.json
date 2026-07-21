@@ -1,0 +1,17 @@
+{
+  "name": "FemCare — PCOD/PCOS Tracker",
+  "short_name": "FemCare",
+  "description": "A gentle, private companion for tracking PCOD/PCOS symptoms and cycle patterns.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FFF8F3",
+  "theme_color": "#E0859F",
+  "icons": [
+    {
+      "src": "https://media.base44.com/images/public/6a547584a0e6c746a78f8067/ea2a99f0c_generated_image.png",
+      "sizes": "any",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

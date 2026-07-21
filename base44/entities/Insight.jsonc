@@ -1,0 +1,72 @@
+{
+  "name": "Insight",
+  "type": "object",
+  "properties": {
+    "awareness_level": {
+      "type": "string",
+      "enum": [
+        "low",
+        "moderate",
+        "high"
+      ]
+    },
+    "reasoning_summary": {
+      "type": "string"
+    },
+    "symptom_impacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "symptom": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "symptom",
+          "impact"
+        ]
+      }
+    },
+    "correlations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "red_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "doctor_nudge": {
+      "type": "boolean",
+      "default": false
+    },
+    "doctor_nudge_reason": {
+      "type": "string"
+    },
+    "weekly_trend_summary": {
+      "type": "string"
+    },
+    "log_count_analyzed": {
+      "type": "number"
+    },
+    "date_range_start": {
+      "type": "string",
+      "format": "date"
+    },
+    "date_range_end": {
+      "type": "string",
+      "format": "date"
+    }
+  },
+  "required": [
+    "awareness_level",
+    "reasoning_summary"
+  ]
+}

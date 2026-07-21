@@ -1,0 +1,57 @@
+{
+  "name": "UserProfile",
+  "type": "object",
+  "properties": {
+    "display_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "age": {
+      "type": "number",
+      "minimum": 18,
+      "maximum": 60
+    },
+    "diagnosis_status": {
+      "type": "string",
+      "enum": [
+        "suspect",
+        "diagnosed",
+        "not_sure"
+      ],
+      "default": "not_sure"
+    },
+    "cycle_regularity": {
+      "type": "string",
+      "enum": [
+        "regular",
+        "irregular",
+        "very_irregular",
+        "unknown"
+      ],
+      "default": "unknown"
+    },
+    "typical_cycle_length": {
+      "type": "number",
+      "minimum": 15,
+      "maximum": 60
+    },
+    "has_ultrasound_finding": {
+      "type": "boolean",
+      "default": false
+    },
+    "ultrasound_notes": {
+      "type": "string"
+    },
+    "disclaimer_acknowledged": {
+      "type": "boolean",
+      "default": false
+    },
+    "onboarding_completed": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "display_name"
+  ]
+}
