@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { symptomLogService } from '@/services/symptomLogs';
-import { insightService } from '@/services/insights';
+import { insightService, aiService } from '@/services/insights';
 import { Button } from '@/components/ui/button';
-import { Printer, FileText, Calendar, Droplet, Heart, Moon } from 'lucide-react';
+import { Printer, FileText, Calendar, Droplet, Heart, Moon, Sparkles, Loader2 } from 'lucide-react';
 import { format, subDays, isAfter, parseISO, differenceInDays } from 'date-fns';
 
 const periods = [30, 60, 90];
@@ -13,6 +13,22 @@ export default function DoctorReport() {
   const [logs, setLogs] = useState(null);
   const [insight, setInsight] = useState(null);
   const [selectedPeriod, setSelectedPeriod] = useState(30);
+  const [aiSummary, setAiSummary] = useState(null);
+  const [generatingSummary, setGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState(null);
+
+  async function handleGenerateSummary() {
+    setGeneratingSummary(true);
+    setSummaryError(null);
+    try {
+      const summary = await aiService.generateDoctorSummary(selectedPeriod);
+      setAiSummary(summary);
+    } catch (e) {
+      setSummaryError(e.response?.data?.error || 'Failed to generate summary. Please try again.');
+    } finally {
+      setGeneratingSummary(false);
+    }
+  }
 
   useEffect(() => {
     async function loadData() {
@@ -86,6 +102,15 @@ export default function DoctorReport() {
             Last {p} days
           </button>
         ))}
+        <Button
+          onClick={handleGenerateSummary}
+          disabled={generatingSummary || !report || report.totalLogs === 0}
+          variant="outline"
+          className="rounded-xl h-10 px-4"
+        >
+          {generatingSummary ? <Loader2 size={16} className="mr-1.5 animate-spin" /> : <Sparkles size={16} className="mr-1.5" />}
+          AI Summary
+        </Button>
         <Button onClick={() => window.print()} className="ml-auto rounded-xl h-10 px-4">
           <Printer size={16} className="mr-1.5" /> Print / Save PDF
         </Button>
@@ -191,6 +216,16 @@ export default function DoctorReport() {
                 </div>
               </div>
             </ReportSection>
+
+            {(aiSummary || summaryError) && (
+              <ReportSection icon={Sparkles} title="AI Visit Summary">
+                {summaryError ? (
+                  <p className="text-sm text-destructive">{summaryError}</p>
+                ) : (
+                  <p className="text-sm text-foreground/80 leading-relaxed">{aiSummary}</p>
+                )}
+              </ReportSection>
+            )}
 
             {insight && (
               <ReportSection icon={FileText} title="AI Awareness Summary">

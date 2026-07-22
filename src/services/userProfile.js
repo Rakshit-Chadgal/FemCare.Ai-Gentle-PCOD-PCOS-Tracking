@@ -3,7 +3,7 @@ import { apiClient } from '@/api/client';
 export const userProfileService = {
   async get() {
     try {
-      const { data } = await apiClient.get('/user-profile');
+      const { data } = await apiClient.get('/profiles/me');
       return data;
     } catch (err) {
       if (err.response?.status === 404) return null;
@@ -11,17 +11,18 @@ export const userProfileService = {
     }
   },
 
+  // Both create and update use the same upsert endpoint
   async create(payload) {
-    const { data } = await apiClient.post('/user-profile', payload);
+    const { data } = await apiClient.post('/profiles/me', payload);
     return data;
   },
 
   async update(payload) {
-    const { data } = await apiClient.put('/user-profile', payload);
+    const { data } = await apiClient.post('/profiles/me', payload);
     return data;
   },
 
   async remove() {
-    await apiClient.delete('/user-profile');
+    await apiClient.delete('/profiles/me');
   },
 };

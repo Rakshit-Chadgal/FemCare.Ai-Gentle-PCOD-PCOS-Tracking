@@ -15,3 +15,10 @@ export const insightService = {
     await apiClient.delete('/insights');
   },
 };
+
+export const aiService = {
+  async generateDoctorSummary(period) {
+    const { data } = await apiClient.post('/ai/summary/doctor-report', { period });
+    return data.summary;
+  },
+};

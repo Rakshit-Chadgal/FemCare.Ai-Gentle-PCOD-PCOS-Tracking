@@ -99,7 +99,7 @@ export default function Log() {
     if (!editingId) return;
     setDeleting(true);
     try {
-      await symptomLogService.remove(editingId);
+      await symptomLogService.remove(formData.log_date);
       setFormData({ ...defaultForm, log_date: formData.log_date });
       setEditingId(null);
       setSaved(false);
