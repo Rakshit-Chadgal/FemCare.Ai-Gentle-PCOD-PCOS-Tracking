@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FemCare.AI - ECS service and Auto Scaling stack.
+  Deploys the Fargate task, ECS service, and three scaling policies:
+    1. ALBRequestCountPerTarget  (primary - request pressure)
+    2. ECSServiceAverageCPUUtilization  (secondary - compute pressure)
+    3. ECSServiceAverageMemoryUtilization  (tertiary - memory guard)
+  All secrets are resolved from AWS Secrets Manager at runtime.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: femcare
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: prod
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: ECR image tag to deploy (e.g. v1.2.3 or a Git SHA).
+
+  # ── Task sizing ───────────────────────────────────────────────────────────────
+  # Node/Express with bcrypt and Mongoose is CPU-light but memory-moderate.
+  # 512 CPU / 1024 MB is the right baseline; scale out before scaling up.
+  TaskCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048]
+    Description: Fargate task CPU units (1024 = 1 vCPU).
+
+  TaskMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096]
+    Description: Fargate task memory in MiB.
+
+  # ── Service scaling bounds ────────────────────────────────────────────────────
+  MinTasks:
+    Type: Number
+    Default: 1
+    Description: Minimum number of running tasks. Use 2 for prod HA.
+
+  MaxTasks:
+    Type: Number
+    Default: 10
+    Description: Maximum number of tasks Auto Scaling may launch.
+
+  DesiredTasks:
+    Type: Number
+    Default: 1
+    Description: Initial desired task count at deploy time.
+
+  # ── Scaling thresholds ────────────────────────────────────────────────────────
+  # RequestCountScaleOutThreshold: requests per target per minute that triggers
+  # a scale-out. 1000 req/min per task is a safe ceiling for this workload
+  # (most endpoints are fast DB reads; AI endpoints are rate-limited separately).
+  RequestCountScaleOutThreshold:
+    Type: Number
+    Default: 1000
+
+  CPUScaleOutThreshold:
+    Type: Number
+    Default: 70
+    Description: CPU % that triggers scale-out.
+
+  CPUScaleInThreshold:
+    Type: Number
+    Default: 30
+    Description: CPU % that triggers scale-in.
+
+  MemoryScaleOutThreshold:
+    Type: Number
+    Default: 80
+    Description: Memory % that triggers scale-out.
+
+  # ── Secrets Manager secret name ───────────────────────────────────────────────
+  # The secret must be a JSON object with keys matching the env var names below.
+  # Create it once: aws secretsmanager create-secret --name femcare/prod/backend
+  SecretName:
+    Type: String
+    Default: femcare/prod/backend
+    Description: >
+      Secrets Manager secret name containing all backend environment variables.
+      Expected JSON keys: MONGODB_URI, JWT_SECRET, JWT_EXPIRES_IN,
+      GOOGLE_CLIENT_ID, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
+      EMAIL_FROM, OPENAI_API_KEY, FRONTEND_URL, REDIS_URL,
+      EMAIL_ENCRYPTION_KEY, DATA_RETENTION_DAYS, PRIVACY_CONTACT_EMAIL,
+      MONGO_MAX_POOL_SIZE, MONGO_MIN_POOL_SIZE.
+
+Resources:
+
+  # ── IAM Roles ─────────────────────────────────────────────────────────────────
+
+  # Task execution role: used by ECS agent to pull images and fetch secrets
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}*"
+
+  # Task role: used by the running application container itself
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      # No extra permissions needed — the app talks to MongoDB Atlas (external)
+      # and OpenAI (external). Add policies here if AWS services are added later.
+
+  # Auto Scaling role: allows Application Auto Scaling to modify ECS service
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-autoscaling-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  # ── CloudWatch Log Group ──────────────────────────────────────────────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Environment}"
+      RetentionInDays: 30
+
+  # ── ECS Task Definition ───────────────────────────────────────────────────────
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc          # required for Fargate
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          # Image URI is constructed from the ECR export set in the foundation stack
+          Image: !Sub
+            - "${ECRUri}:${ImageTag}"
+            - ECRUri:
+                Fn::ImportValue: !Sub "${ProjectName}-ecr-uri"
+          PortMappings:
+            - ContainerPort: 4000
+              Protocol: tcp
+          Essential: true
+          # ── Environment variables resolved from Secrets Manager at task start ──
+          # The ECS agent fetches the secret JSON and injects each key as an
+          # individual environment variable. The secret value never enters this
+          # template or the CloudFormation state.
+          Secrets:
+            - Name: MONGODB_URI
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:MONGODB_URI::"
+            - Name: JWT_SECRET
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:JWT_SECRET::"
+            - Name: JWT_EXPIRES_IN
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:JWT_EXPIRES_IN::"
+            - Name: GOOGLE_CLIENT_ID
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:GOOGLE_CLIENT_ID::"
+            - Name: SMTP_HOST
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:SMTP_HOST::"
+            - Name: SMTP_PORT
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:SMTP_PORT::"
+            - Name: SMTP_USER
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:SMTP_USER::"
+            - Name: SMTP_PASS
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:SMTP_PASS::"
+            - Name: EMAIL_FROM
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:EMAIL_FROM::"
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:OPENAI_API_KEY::"
+            - Name: FRONTEND_URL
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:FRONTEND_URL::"
+            - Name: REDIS_URL
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:REDIS_URL::"
+            - Name: EMAIL_ENCRYPTION_KEY
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:EMAIL_ENCRYPTION_KEY::"
+            - Name: DATA_RETENTION_DAYS
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:DATA_RETENTION_DAYS::"
+            - Name: PRIVACY_CONTACT_EMAIL
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:PRIVACY_CONTACT_EMAIL::"
+            - Name: MONGO_MAX_POOL_SIZE
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:MONGO_MAX_POOL_SIZE::"
+            - Name: MONGO_MIN_POOL_SIZE
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}:MONGO_MIN_POOL_SIZE::"
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: "4000"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "wget -qO- http://localhost:4000/health || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60    # give Node time to connect to MongoDB on cold start
+
+  # ── ECS Service ───────────────────────────────────────────────────────────────
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
+      Cluster:
+        Fn::ImportValue: !Sub "${ProjectName}-cluster-name"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredTasks
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED    # tasks are in private subnets
+          Subnets:
+            - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-private-subnet-1"
+            - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-private-subnet-2"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-ecs-sg-id"
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 4000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub "${ProjectName}-${Environment}-tg-arn"
+      DeploymentConfiguration:
+        # Rolling deploy: always keep at least 1 task healthy during updates
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true    # auto-rollback if new tasks fail health checks
+      HealthCheckGracePeriodSeconds: 60
+
+  # ── Application Auto Scaling: register the ECS service as a scalable target ──
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub
+        - "service/${ClusterName}/${ServiceName}"
+        - ClusterName:
+            Fn::ImportValue: !Sub "${ProjectName}-cluster-name"
+          ServiceName: !GetAtt ECSService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SCALING POLICY 1 — ALB Request Count Per Target (primary signal)
+  #
+  # Rationale: request count is the most direct measure of load for a REST API.
+  # Target tracking keeps requests-per-task near the threshold automatically.
+  # Scale-out is fast (60s cooldown); scale-in is conservative (300s cooldown)
+  # to avoid thrashing when traffic is bursty.
+  # ════════════════════════════════════════════════════════════════════════════
+  ScalingPolicyRequests:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-scale-on-requests"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref RequestCountScaleOutThreshold
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          # ResourceLabel links this policy to the specific ALB target group.
+          # Format: app/<alb-name>/<alb-id>/targetgroup/<tg-name>/<tg-id>
+          ResourceLabel: !Sub
+            - "${ALBSuffix}/${TGSuffix}"
+            - ALBSuffix: !Select
+                - 1
+                - !Split
+                  - "loadbalancer/"
+                  - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-alb-dns"
+              TGSuffix: !Select
+                - 1
+                - !Split
+                  - ":targetgroup/"
+                  - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-tg-arn"
+        ScaleOutCooldown: 60     # seconds before another scale-out can occur
+        ScaleInCooldown: 300     # seconds before scale-in (conservative)
+        DisableScaleIn: false
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SCALING POLICY 2 — CPU Utilization (secondary signal)
+  #
+  # Rationale: bcrypt password hashing (login/register) and JSON serialisation
+  # of large log arrays are CPU-bound. If CPU spikes without a proportional
+  # request count increase (e.g. a few expensive AI requests), this policy
+  # catches it. Target tracking at 70% leaves headroom for bursts.
+  # ════════════════════════════════════════════════════════════════════════════
+  ScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-scale-on-cpu"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CPUScaleOutThreshold
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        DisableScaleIn: false
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SCALING POLICY 3 — Memory Utilization (tertiary guard)
+  #
+  # Rationale: the AI route loads up to 200 symptom logs into memory per
+  # request and builds large prompt strings. A memory leak or an unusually
+  # large dataset could push a task toward OOM. This policy adds tasks before
+  # the OOM killer fires. Scale-in is disabled — memory does not self-recover
+  # after a spike the way CPU does; only a task restart clears it.
+  # ════════════════════════════════════════════════════════════════════════════
+  ScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-scale-on-memory"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref MemoryScaleOutThreshold
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 600     # longer cooldown — memory does not drop quickly
+        DisableScaleIn: true     # never scale in on memory alone
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CLOUDWATCH ALARMS — operational visibility and SNS notification hooks
+  # These alarms do NOT drive scaling (target tracking manages its own alarms
+  # internally). These are for human operators and PagerDuty/Slack integration.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Alarm: task count has hit the maximum — scaling is saturated
+  AlarmMaxTasksReached:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-max-tasks-reached"
+      AlarmDescription: >
+        ECS service has scaled to MaxTasks. If sustained, increase MaxTasks
+        or investigate the source of load.
+      Namespace: AWS/ECS
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub "${ProjectName}-cluster-name"
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref MaxTasks
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # Alarm: no tasks are running — complete service outage
+  AlarmNoRunningTasks:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-no-running-tasks"
+      AlarmDescription: >
+        ECS service has zero running tasks. Immediate investigation required.
+      Namespace: AWS/ECS
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub "${ProjectName}-cluster-name"
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching    # missing data = task crashed = alarm
+
+  # Alarm: sustained high CPU across the service
+  AlarmHighCPU:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-high-cpu"
+      AlarmDescription: >
+        Average CPU across all tasks has exceeded 85% for 5 minutes.
+        Auto Scaling should have added tasks; this alarm fires if it has not
+        resolved within the evaluation window.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub "${ProjectName}-cluster-name"
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Alarm: ALB 5xx error rate spike (unhealthy tasks or application errors)
+  Alarm5xxErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-5xx-errors"
+      AlarmDescription: >
+        ALB target group is returning 5xx errors. May indicate a bad deploy,
+        database connectivity loss, or OpenAI API failure.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: TargetGroup
+          Value:
+            Fn::Select:
+              - 5
+              - Fn::Split:
+                  - ":"
+                  - Fn::ImportValue: !Sub "${ProjectName}-${Environment}-tg-arn"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ECSServiceName:
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-service-name"
+
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+
+  ScalableTargetId:
+    Value: !Ref ScalableTarget
+
+  LogGroupName:
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-log-group"

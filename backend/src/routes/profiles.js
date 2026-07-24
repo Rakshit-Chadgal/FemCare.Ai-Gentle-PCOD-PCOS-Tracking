@@ -2,61 +2,45 @@ const express = require('express');
 const UserProfile = require('../models/userProfile');
 const requireAuth = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const cache = require('../services/cache');
+const { validate, profileUpdateSchema } = require('../middleware/validate');
 
 const router = express.Router();
-
-// All profile routes require auth
 router.use(requireAuth);
 
 // ─── GET /api/profiles/me ────────────────────────────────────────────────────
 router.get(
   '/me',
   asyncHandler(async (req, res) => {
+    const key = cache.KEY.profile(req.userId);
+
+    const cached = await cache.get(key);
+    if (cached) return res.json(cached);
+
     const profile = await UserProfile.findOne({ userId: req.userId }).lean();
     if (!profile) return res.status(404).json({ error: 'Profile not found' });
-    res.json(toClientProfile(profile));
+
+    const payload = toClientProfile(profile);
+    await cache.set(key, payload, cache.TTL.PROFILE);
+    res.json(payload);
   })
 );
 
 // ─── POST /api/profiles/me ───────────────────────────────────────────────────
-// Creates or updates the profile (upsert)
 router.post(
   '/me',
+  validate(profileUpdateSchema),
   asyncHandler(async (req, res) => {
-    const {
-      display_name,
-      age,
-      diagnosis_status,
-      cycle_regularity,
-      typical_cycle_length,
-      has_ultrasound_finding,
-      ultrasound_notes,
-      disclaimer_acknowledged,
-      onboarding_completed,
-    } = req.body;
-
-    if (!display_name || !display_name.trim()) {
-      return res.status(400).json({ error: 'display_name is required' });
-    }
-
     const update = {
-      displayName: display_name.trim(),
-      ...(age !== undefined && { age: Number(age) }),
-      ...(diagnosis_status && { diagnosisStatus: diagnosis_status }),
-      ...(cycle_regularity && { cycleRegularity: cycle_regularity }),
-      ...(typical_cycle_length !== undefined && {
-        typicalCycleLength: Number(typical_cycle_length),
-      }),
-      ...(has_ultrasound_finding !== undefined && {
-        hasUltrasoundFinding: Boolean(has_ultrasound_finding),
-      }),
-      ...(ultrasound_notes !== undefined && { ultrasoundNotes: ultrasound_notes }),
-      ...(disclaimer_acknowledged !== undefined && {
-        disclaimerAcknowledged: Boolean(disclaimer_acknowledged),
-      }),
-      ...(onboarding_completed !== undefined && {
-        onboardingCompleted: Boolean(onboarding_completed),
-      }),
+      displayName: req.body.display_name,
+      ...(req.body.age !== undefined && { age: Number(req.body.age) }),
+      ...(req.body.diagnosis_status && { diagnosisStatus: req.body.diagnosis_status }),
+      ...(req.body.cycle_regularity && { cycleRegularity: req.body.cycle_regularity }),
+      ...(req.body.typical_cycle_length !== undefined && { typicalCycleLength: Number(req.body.typical_cycle_length) }),
+      ...(req.body.has_ultrasound_finding !== undefined && { hasUltrasoundFinding: Boolean(req.body.has_ultrasound_finding) }),
+      ...(req.body.ultrasound_notes !== undefined && { ultrasoundNotes: req.body.ultrasound_notes }),
+      ...(req.body.disclaimer_acknowledged !== undefined && { disclaimerAcknowledged: Boolean(req.body.disclaimer_acknowledged) }),
+      ...(req.body.onboarding_completed !== undefined && { onboardingCompleted: Boolean(req.body.onboarding_completed) }),
     };
 
     const profile = await UserProfile.findOneAndUpdate(
@@ -65,22 +49,23 @@ router.post(
       { new: true, upsert: true, runValidators: true }
     ).lean();
 
-    res.json(toClientProfile(profile));
+    const payload = toClientProfile(profile);
+    await cache.set(cache.KEY.profile(req.userId), payload, cache.TTL.PROFILE);
+    res.json(payload);
   })
 );
 
 // ─── DELETE /api/profiles/me ─────────────────────────────────────────────────
-// Used by account deletion flow in Profile.jsx
 router.delete(
   '/me',
   asyncHandler(async (req, res) => {
     await UserProfile.deleteOne({ userId: req.userId });
+    await cache.del(cache.KEY.profile(req.userId));
     res.status(204).end();
   })
 );
 
 // ─── Serializer ──────────────────────────────────────────────────────────────
-// Maps camelCase Mongoose doc → snake_case for the frontend (matches Base44 shape)
 function toClientProfile(doc) {
   return {
     id: doc._id,

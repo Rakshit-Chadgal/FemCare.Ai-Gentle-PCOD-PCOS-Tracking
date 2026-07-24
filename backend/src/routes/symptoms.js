@@ -2,22 +2,31 @@ const express = require('express');
 const SymptomLog = require('../models/symptomLog');
 const requireAuth = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const cache = require('../services/cache');
+const { validate, logCreateSchema } = require('../middleware/validate');
 
 const router = express.Router();
-
 router.use(requireAuth);
 
 // ─── GET /api/symptom-logs ───────────────────────────────────────────────────
-// Query params: limit (default 200), sort (default -logDate)
 router.get(
   '/',
   asyncHandler(async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const key = cache.KEY.logsList(req.userId, limit);
+
+    const cached = await cache.get(key);
+    if (cached) return res.json(cached);
+
     const logs = await SymptomLog.find({ userId: req.userId })
       .sort({ logDate: -1 })
       .limit(limit)
+      .select('-__v')
       .lean();
-    res.json(logs.map(toClientLog));
+
+    const payload = logs.map(toClientLog);
+    await cache.set(key, payload, cache.TTL.LOGS);
+    res.json(payload);
   })
 );
 
@@ -25,57 +34,44 @@ router.get(
 router.get(
   '/:date',
   asyncHandler(async (req, res) => {
+    const key = cache.KEY.logsDate(req.userId, req.params.date);
+
+    const cached = await cache.get(key);
+    if (cached) return res.json(cached);
+
     const log = await SymptomLog.findOne({
       userId: req.userId,
       logDate: req.params.date,
     }).lean();
+
     if (!log) return res.status(404).json({ error: 'Log not found' });
-    res.json(toClientLog(log));
+
+    const payload = toClientLog(log);
+    await cache.set(key, payload, cache.TTL.LOGS);
+    res.json(payload);
   })
 );
 
 // ─── POST /api/symptom-logs ──────────────────────────────────────────────────
-// Upsert by (userId, logDate) — matches Base44's create + filter pattern
 router.post(
   '/',
+  validate(logCreateSchema),
   asyncHandler(async (req, res) => {
-    const {
-      log_date,
-      cycle_started,
-      cycle_ended,
-      acne_severity,
-      facial_hair_growth,
-      hair_thinning,
-      weight_change,
-      mood,
-      sleep_quality,
-      pelvic_pain,
-      pelvic_pain_severity,
-      cravings_intensity,
-      discomfort_areas,
-      notes,
-    } = req.body;
-
-    if (!log_date || !/^\d{4}-\d{2}-\d{2}$/.test(log_date)) {
-      return res.status(400).json({ error: 'log_date must be YYYY-MM-DD' });
-    }
-
+    const log_date = req.body.log_date;
     const update = {
-      ...(cycle_started !== undefined && { cycleStarted: Boolean(cycle_started) }),
-      ...(cycle_ended !== undefined && { cycleEnded: Boolean(cycle_ended) }),
-      ...(acne_severity !== undefined && { acneSeverity: Number(acne_severity) }),
-      ...(facial_hair_growth !== undefined && { facialHairGrowth: Boolean(facial_hair_growth) }),
-      ...(hair_thinning !== undefined && { hairThinning: Boolean(hair_thinning) }),
-      ...(weight_change !== undefined && { weightChange: weight_change }),
-      ...(mood !== undefined && { mood: Number(mood) }),
-      ...(sleep_quality !== undefined && { sleepQuality: Number(sleep_quality) }),
-      ...(pelvic_pain !== undefined && { pelvicPain: Boolean(pelvic_pain) }),
-      ...(pelvic_pain_severity !== undefined && {
-        pelvicPainSeverity: Number(pelvic_pain_severity),
-      }),
-      ...(cravings_intensity !== undefined && { cravingsIntensity: Number(cravings_intensity) }),
-      ...(discomfort_areas !== undefined && { discomfortAreas: discomfort_areas }),
-      ...(notes !== undefined && { notes }),
+      ...(req.body.cycle_started !== undefined && { cycleStarted: Boolean(req.body.cycle_started) }),
+      ...(req.body.cycle_ended !== undefined && { cycleEnded: Boolean(req.body.cycle_ended) }),
+      ...(req.body.acne_severity !== undefined && { acneSeverity: Number(req.body.acne_severity) }),
+      ...(req.body.facial_hair_growth !== undefined && { facialHairGrowth: Boolean(req.body.facial_hair_growth) }),
+      ...(req.body.hair_thinning !== undefined && { hairThinning: Boolean(req.body.hair_thinning) }),
+      ...(req.body.weight_change !== undefined && { weightChange: req.body.weight_change }),
+      ...(req.body.mood !== undefined && { mood: Number(req.body.mood) }),
+      ...(req.body.sleep_quality !== undefined && { sleepQuality: Number(req.body.sleep_quality) }),
+      ...(req.body.pelvic_pain !== undefined && { pelvicPain: Boolean(req.body.pelvic_pain) }),
+      ...(req.body.pelvic_pain_severity !== undefined && { pelvicPainSeverity: Number(req.body.pelvic_pain_severity) }),
+      ...(req.body.cravings_intensity !== undefined && { cravingsIntensity: Number(req.body.cravings_intensity) }),
+      ...(req.body.discomfort_areas !== undefined && { discomfortAreas: req.body.discomfort_areas }),
+      ...(req.body.notes !== undefined && { notes: req.body.notes }),
     };
 
     const log = await SymptomLog.findOneAndUpdate(
@@ -84,7 +80,14 @@ router.post(
       { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
     ).lean();
 
-    res.status(200).json(toClientLog(log));
+    const payload = toClientLog(log);
+
+    await Promise.all([
+      cache.delPattern(`fc:logs:list:${req.userId}:*`),
+      cache.set(cache.KEY.logsDate(req.userId, log_date), payload, cache.TTL.LOGS),
+    ]);
+
+    res.status(200).json(payload);
   })
 );
 
@@ -99,15 +102,22 @@ router.delete(
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Log not found' });
     }
+
+    await Promise.all([
+      cache.delPattern(`fc:logs:list:${req.userId}:*`),
+      cache.del(cache.KEY.logsDate(req.userId, req.params.date)),
+    ]);
+
     res.status(204).end();
   })
 );
 
-// ─── DELETE /api/symptom-logs (bulk — used by account deletion) ──────────────
+// ─── DELETE /api/symptom-logs (bulk) ─────────────────────────────────────────
 router.delete(
   '/',
   asyncHandler(async (req, res) => {
     await SymptomLog.deleteMany({ userId: req.userId });
+    await cache.delPattern(`fc:logs:*:${req.userId}:*`);
     res.status(204).end();
   })
 );

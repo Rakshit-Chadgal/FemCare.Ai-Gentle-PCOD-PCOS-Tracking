@@ -4,6 +4,8 @@ const UserProfile = require('../models/userProfile');
 const Insight = require('../models/insight');
 const requireAuth = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const cache = require('../services/cache');
+const { validate, aiInsightSchema } = require('../middleware/validate');
 
 const router = express.Router();
 
@@ -180,8 +182,22 @@ router.post(
     }
 
     const [rawLogs, profile] = await Promise.all([
-      SymptomLog.find({ userId: req.userId }).sort({ logDate: -1 }).limit(200).lean(),
-      UserProfile.findOne({ userId: req.userId }).lean(),
+      (async () => {
+        const logsKey = cache.KEY.logsList(req.userId, 200);
+        const cachedLogs = await cache.get(logsKey);
+        if (cachedLogs) return cachedLogs;
+        const logs = await SymptomLog.find({ userId: req.userId }).sort({ logDate: -1 }).limit(200).lean();
+        if (logs.length > 0) await cache.set(logsKey, logs, cache.TTL.LOGS);
+        return logs;
+      })(),
+      (async () => {
+        const profileKey = cache.KEY.profile(req.userId);
+        const cachedProfile = await cache.get(profileKey);
+        if (cachedProfile) return cachedProfile;
+        const p = await UserProfile.findOne({ userId: req.userId }).lean();
+        if (p) await cache.set(profileKey, p, cache.TTL.PROFILE);
+        return p;
+      })(),
     ]);
 
     if (rawLogs.length === 0) {
@@ -240,6 +256,9 @@ router.post(
       dateRangeEnd: ind.dateRange?.end,
     });
 
+    // Invalidate insights cache so the next GET returns the freshly generated insight
+    await cache.del(cache.KEY.insights(req.userId));
+
     res.status(201).json({
       id: insight._id,
       awareness_level: insight.awarenessLevel,
@@ -261,23 +280,35 @@ router.post(
 // ─── POST /api/ai/summary/doctor-report ─────────────────────────────────────
 router.post(
   '/summary/doctor-report',
+  validate(aiInsightSchema),
   asyncHandler(async (req, res) => {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(503).json({ error: 'AI service not configured. Add OPENAI_API_KEY to .env' });
     }
 
-    const period = Number(req.body.period);
-    if (![30, 60, 90].includes(period)) {
-      return res.status(400).json({ error: 'period must be 30, 60, or 90' });
-    }
+    const { period } = req.body;
 
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - period);
     const cutoffStr = cutoff.toISOString().slice(0, 10);
 
     const [rawLogs, profile] = await Promise.all([
-      SymptomLog.find({ userId: req.userId, logDate: { $gte: cutoffStr } }).sort({ logDate: 1 }).lean(),
-      UserProfile.findOne({ userId: req.userId }).lean(),
+      (async () => {
+        const logsKey = cache.KEY.logsList(req.userId, 200);
+        const cachedLogs = await cache.get(logsKey);
+        if (cachedLogs) return cachedLogs;
+        const logs = await SymptomLog.find({ userId: req.userId, logDate: { $gte: cutoffStr } }).sort({ logDate: 1 }).lean();
+        if (logs.length > 0) await cache.set(logsKey, logs, cache.TTL.LOGS);
+        return logs;
+      })(),
+      (async () => {
+        const profileKey = cache.KEY.profile(req.userId);
+        const cachedProfile = await cache.get(profileKey);
+        if (cachedProfile) return cachedProfile;
+        const p = await UserProfile.findOne({ userId: req.userId }).lean();
+        if (p) await cache.set(profileKey, p, cache.TTL.PROFILE);
+        return p;
+      })(),
     ]);
 
     if (rawLogs.length === 0) {

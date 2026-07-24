@@ -6,15 +6,19 @@
   "type": "commonjs",
   "scripts": {
     "dev": "nodemon src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "audit": "npm audit --audit-level=moderate",
+    "audit:fix": "npm audit fix",
+    "audit:ci": "npm audit --audit-level=moderate --json > audit-report.json"
   },
   "dependencies": {
-    "express-rate-limit": "^7.3.1",
-    "google-auth-library": "^9.10.0",
-    "helmet": "^7.1.0",
-    "nodemailer": "^6.9.13",
-    "openai": "^4.52.0",
-    "zod": "^3.23.8"
+    "express-rate-limit": "^8.6.0",
+    "google-auth-library": "^9.14.0",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.11.1",
+    "nodemailer": "^7.0.0",
+    "openai": "^5.0.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.3"

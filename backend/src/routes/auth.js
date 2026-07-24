@@ -7,6 +7,7 @@ const UserProfile = require('../models/userProfile');
 const { sendOtp, sendPasswordReset } = require('../services/emailService');
 const requireAuth = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { validate, authRegisterSchema, authLoginSchema, authGoogleSchema, authForgotPasswordSchema, authResetPasswordSchema } = require('../middleware/validate');
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -26,14 +27,9 @@ function generateOtp() {
 // ─── POST /api/auth/register ─────────────────────────────────────────────────
 router.post(
   '/register',
+  validate(authRegisterSchema),
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    }
 
     const existing = await User.findOne({ email: email.toLowerCase() });
     if (existing) {
@@ -94,7 +90,6 @@ router.post(
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) {
-      // Don't reveal whether the email exists
       return res.json({ message: 'If that email exists, a new code was sent' });
     }
 
@@ -111,11 +106,9 @@ router.post(
 // ─── POST /api/auth/login ────────────────────────────────────────────────────
 router.post(
   '/login',
+  validate(authLoginSchema),
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
 
     const user = await User.findOne({ email: email.toLowerCase() }).select('+passwordHash');
     if (!user || !user.passwordHash) {
@@ -128,7 +121,6 @@ router.post(
     }
 
     if (!user.emailVerified) {
-      // Resend OTP so they can verify
       const otp = generateOtp();
       user.otpCode = otp;
       user.otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -148,9 +140,9 @@ router.post(
 // ─── POST /api/auth/google ───────────────────────────────────────────────────
 router.post(
   '/google',
+  validate(authGoogleSchema),
   asyncHandler(async (req, res) => {
     const { idToken } = req.body;
-    if (!idToken) return res.status(400).json({ error: 'idToken is required' });
 
     const ticket = await googleClient.verifyIdToken({
       idToken,
@@ -176,12 +168,12 @@ router.post(
   })
 );
 
-// ─── POST /api/auth/forgot-password ─────────────────────────────────────────
+// ─── POST /api/auth/forgot-password ──────────────────────────────────────────
 router.post(
   '/forgot-password',
+  validate(authForgotPasswordSchema),
   asyncHandler(async (req, res) => {
     const { email } = req.body;
-    // Always respond 200 to avoid email enumeration
     res.json({ message: 'If that email exists, a reset link was sent' });
 
     if (!email) return;
@@ -201,14 +193,9 @@ router.post(
 // ─── POST /api/auth/reset-password ──────────────────────────────────────────
 router.post(
   '/reset-password',
+  validate(authResetPasswordSchema),
   asyncHandler(async (req, res) => {
     const { resetToken, newPassword } = req.body;
-    if (!resetToken || !newPassword) {
-      return res.status(400).json({ error: 'Token and new password are required' });
-    }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    }
 
     const user = await User.findOne({ resetToken }).select('+resetToken +resetTokenExpiry');
     if (!user || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
@@ -229,15 +216,13 @@ router.get(
   '/me',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const user = await User.findById(req.userId).lean();
+    const user = await User.findById(req.userId).select('email role').lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ id: user._id, email: user.email, role: user.role });
   })
 );
 
 // ─── POST /api/auth/logout ───────────────────────────────────────────────────
-// JWT is stateless — logout is handled client-side by deleting the token.
-// This endpoint exists so the frontend has a consistent API surface.
 router.post('/logout', requireAuth, (req, res) => {
   res.json({ message: 'Logged out' });
 });

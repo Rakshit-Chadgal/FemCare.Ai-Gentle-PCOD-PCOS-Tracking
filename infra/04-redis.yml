@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FemCare.AI - Redis ElastiCache stack.
+  Creates a Redis cluster in the private subnets for the caching layer.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: femcare
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: prod
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID (imported from networking stack).
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet ID.
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet ID.
+
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+    Description: ElastiCache node type.
+
+  RedisEngineVersion:
+    Type: String
+    Default: "7.1"
+    Description: Redis engine version.
+
+Resources:
+
+  # ── Subnet Group ─────────────────────────────────────────────────────────────
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub "${ProjectName}-${Environment}-redis-subnet-group"
+      Description: Subnet group for FemCare Redis cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  # ── Security Group ────────────────────────────────────────────────────────────
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound Redis from ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref RedisSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-redis-sg"
+
+  # ── Redis Cluster ─────────────────────────────────────────────────────────────
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: !Ref RedisNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      Engine: redis
+      EngineVersion: !Ref RedisEngineVersion
+      NumCacheNodes: 1
+      VpcSecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-redis"
+
+Outputs:
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-redis-endpoint"
+
+  RedisPort:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Port
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-redis-port"
