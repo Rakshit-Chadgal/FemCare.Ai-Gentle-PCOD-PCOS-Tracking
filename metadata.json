@@ -1,0 +1,6 @@
+{
+  "name": "FemCare AI",
+  "description": "Gentle PCOD/PCOS Tracking and Health Companion",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
