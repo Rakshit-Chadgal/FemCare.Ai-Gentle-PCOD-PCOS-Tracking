@@ -68,10 +68,17 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(rootDir, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    const fs = require('fs');
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    } else {
+      app.get('/', (req, res) => {
+        res.json({ message: 'FemCare API is running on Render' });
+      });
+    }
   }
 
   const PORT = config.port || 3000;
